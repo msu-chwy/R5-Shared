@@ -1,0 +1,255 @@
+set start_date = '2023-04-07';
+set end_date='2023-04-10';
+
+-- Collect data from ecom_sandbox.pca_segment_hits_products_union
+CREATE OR REPLACE local temp TABLE ecom_sandbox.r5_segment_sessions_hits AS
+SELECT
+    event_action,
+    event_label,
+    event_category,
+    event_type,
+    is_bot,
+    convert_timezone('UTC', 'America/New_York', session_start_timestamp)::date AS session_date,
+    session_id,
+    device_category,
+    channel_grouping AS channel,
+    coalesce(session_traits:has_active_autoship::boolean, session_traits:user_active_autoship::boolean, False) active_autoship_flag, 
+    coalesce(session_traits:has_tried_autoship :: boolean ,session_traits:user_tried_autoship  :: boolean, False) tried_autoship_flag,
+    authentication_state,
+    new_customer_flag,
+    personalization_id AS pid,
+    case when properties:anonymousId::string = 'No Cached Anonymous PID' then personalization_id else properties:anonymousId::string end AS Anon_PID,
+    CUSTOMER_ID,
+    event_id,
+    event_timestamp,
+    event_name,
+    list_category,
+    is_exit,
+    row_type,
+    CONCAT('https://www.chewy.com',PATH_NAME) PATH_NAME,
+    page_type,
+    product_id,
+    order_id,
+    product_merch_classification1,
+    product_merch_classification2,
+    revenue,
+    product_quantity
+FROM
+    segment.segment_hits_products_union
+WHERE session_start_timestamp::DATE BETWEEN $start_date AND $end_date;
+
+SELECT distinct event_label,event_name, event_action
+FROM ecom_sandbox.r5_segment_sessions_hits
+WHERE event_action='forgot-password';
+
+SELECT * 
+FROM ecom_sandbox.r5_segment_sessions_hits
+WHERE event_category='authenticate' AND event_action='sign-in' AND IS_EXIT=TRUE;
+
+-- identify and count key activities
+CREATE OR REPLACE local temp TABLE ecom_sandbox.r5_segment_sessions_aggregate AS
+SELECT
+    --session_date,
+    --device_category,
+    --channel,
+    --new_customer_flag,
+    --product_merch_classification1,
+    --product_merch_classification2,
+    --active_autoship_flag,
+    COUNT(DISTINCT session_id) AS sessions,
+    COUNT(DISTINCT CASE WHEN event_category = 'eec' AND event_action = 'addToCart' THEN event_id END) AS atc_sessions,
+    COUNT(DISTINCT CASE WHEN event_category = 'eec' AND event_action = 'checkout' AND event_label = 'checkout'  THEN event_id END) AS checkout_sessions,
+    COUNT(DISTINCT CASE WHEN event_action='purchase' and event_category='eec' and order_id IS NOT NULL THEN event_id END) AS purchase_sessions,
+    COUNT(DISTINCT CASE WHEN event_action='purchase' and order_id IS NOT NULL THEN order_id ELSE 0 END) AS orders,
+    SUM(CASE WHEN event_name = 'Order Completed' AND row_type = 'hit' AND order_id IS NOT NULL THEN revenue ELSE 0 END) AS transaction_revenue,
+    SUM(CASE WHEN event_name = 'Order Completed' AND row_type = 'product' AND order_id IS NOT NULL THEN product_quantity ELSE 0 END) AS transaction_quantity,
+    --sign-in metrics
+    COUNT(DISTINCT CASE WHEN authentication_state='authenticated' THEN session_id END) AS sign_in_sessions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label='view' THEN event_id END) sign_in_page_impressions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label='view' THEN session_id END) AS sign_in_page_sessions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label = 'submit' THEN event_id END) AS sign_in_clicks,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label = 'success' THEN event_id END) AS sign_in_success,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND is_exit=TRUE THEN session_id END) AS sign_in_exit_sessions,
+    --registration metrics
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='create-account' AND event_label = 'view' THEN event_id END) AS registration_page_impressions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='create-account' AND event_label='view' THEN session_id END) AS registration_page_sessions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='create-account' AND event_label='submit' THEN session_id END) AS registration_clicks,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='create-account' AND event_label = 'success' THEN event_id END) AS registration_success,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='create-account' AND is_exit=TRUE THEN session_id END) AS registration_exit_sessions,
+    --pw reset metrics
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='forgot-password' AND event_label = 'click' THEN event_id END) AS forgot_pw_clicks,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='forgot-password' AND event_label = 'view' THEN event_id END) AS pw_reset_request_page_impressions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='forgot-password' AND event_label = 'view' THEN session_id END) AS pw_reset_request_page_sessions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='forgot-password' AND event_label = 'submit' THEN event_id END) AS request_reset_pw_clicks,
+    COUNT(DISTINCT CASE WHEN event_category='complete-reset-pw' AND event_action='complete' AND event_label = 'view' THEN event_id END) AS pw_reset_page_impressions,
+    -- TBD COUNT(DISTINCT CASE WHEN list_category='change-password' AND is_exit=TRUE THEN unique_visit_id END) AS pw_reset_page_exit_sessions,
+    --ReCAPTCHA
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='recaptcha' AND event_label = 'view' THEN event_id END) AS  recaptcha_impressions,
+    COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='recaptcha' AND event_label = 'check' THEN event_id END) AS  recaptcha_success
+FROM ecom_sandbox.r5_segment_sessions_hits;
+
+SELECT * FROM ecom_sandbox.r5_segment_sessions_aggregate;
+
+-- calculate funnel
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sfw_exp_funnel_steps  AS
+SELECT
+    session_date,
+    device_category,
+    funnel_step,
+    session_id,
+    channel,
+    active_autoship_flag,
+    new_customer_flag
+FROM
+    ecom_sandbox.r5_segment_sessions_hits match_recognize ( partition BY session_id ORDER BY event_timestamp MEASURES classifier AS funnel_step ALL rows per
+    MATCH PATTERN({- Browse -} {- sessions* -} PDP+) DEFINE Browse     AS
+    list_category ilike 'search%'
+       OR  list_category ilike 'browse%'
+       OR  list_category ilike 'deals%'
+       OR  list_category ilike 'brand%'
+       OR  list_category ilike 'campaign%'
+       OR  list_category ilike 'department%'
+       OR  page_type = 'plp', PDP AS (event_category = 'eec'
+       AND event_action = 'detail'
+       AND event_label IN ('In Stock',
+                           'Out of Stock'))
+       OR page_type = 'pdp', ATC AS event_category ='eec'
+       AND event_action = 'addToCart', sessions AS event_id IS NOT NULL, checkout AS event_category =
+           'eec'
+       AND event_action = 'checkout'
+       AND event_label = 'checkout', Purchase AS event_category = 'eec'
+       AND event_action = 'purchase'
+       AND order_id IS NOT NULL )
+WHERE
+        funnel_step = 'PDP' and session_date BETWEEN $start_date AND $end_date
+UNION
+SELECT
+    session_date,
+    device_category,
+    funnel_step,
+    session_id,
+    channel,
+    active_autoship_flag,
+    new_customer_flag
+FROM
+    ecom_sandbox.r5_segment_sessions_hits match_recognize ( partition BY session_id ORDER BY event_timestamp MEASURES classifier AS funnel_step ALL rows per
+    MATCH PATTERN({- PDP -} {- sessions* -} ATC+) DEFINE Browse        AS
+    list_category ilike 'search%'
+       OR  list_category ilike 'browse%'
+       OR  list_category ilike 'deals%'
+       OR  list_category ilike 'brand%'
+       OR  list_category ilike 'campaign%'
+       OR  list_category ilike 'department%'
+       OR  page_type = 'plp', PDP AS (event_category = 'eec'
+       AND event_action = 'detail'
+       AND event_label IN ('In Stock',
+                           'Out of Stock'))
+       OR page_type = 'pdp', ATC AS event_category ='eec'
+       AND event_action = 'addToCart', sessions AS event_id IS NOT NULL, checkout AS event_category =
+           'eec'
+       AND event_action = 'checkout'
+       AND event_label = 'checkout', Purchase AS event_category = 'eec'
+       AND event_action = 'purchase'
+       AND order_id IS NOT NULL )
+WHERE
+        funnel_step = 'ATC' and session_date BETWEEN $start_date AND $end_date
+UNION
+SELECT
+    session_date,
+    device_category,
+    funnel_step,
+    session_id,
+    channel,
+    active_autoship_flag,
+    new_customer_flag
+FROM
+    ecom_sandbox.r5_segment_sessions_hits match_recognize ( partition BY session_id ORDER BY event_timestamp MEASURES classifier AS funnel_step ALL rows per
+    MATCH PATTERN({- ATC -} {- sessions* -} checkout+) DEFINE Browse   AS
+    list_category ilike 'search%'
+       OR  list_category ilike 'browse%'
+       OR  list_category ilike 'deals%'
+       OR  list_category ilike 'brand%'
+       OR  list_category ilike 'campaign%'
+       OR  list_category ilike 'department%'
+       OR  page_type = 'plp', PDP AS (event_category = 'eec'
+       AND event_action = 'detail'
+       AND event_label IN ('In Stock',
+                           'Out of Stock'))
+       OR page_type = 'pdp', ATC AS event_category ='eec'
+       AND event_action = 'addToCart', sessions AS event_id IS NOT NULL, checkout AS event_category =
+           'eec'
+       AND event_action = 'checkout'
+       AND event_label = 'checkout', Purchase AS event_category = 'eec'
+       AND event_action = 'purchase'
+       AND order_id IS NOT NULL )
+WHERE
+        funnel_step = 'CHECKOUT' and session_date BETWEEN $start_date AND $end_date
+UNION
+SELECT
+    session_date,
+    device_category,
+    funnel_step,
+    session_id,
+    channel,
+    active_autoship_flag,
+    new_customer_flag
+FROM
+    ecom_sandbox.r5_segment_sessions_hits match_recognize ( partition BY session_id ORDER BY event_timestamp MEASURES classifier   AS funnel_step ALL rows per
+    MATCH PATTERN({- checkout -} {- sessions* -} Purchase+) DEFINE Browse AS
+    list_category ilike 'search%'
+       OR  list_category ilike 'browse%'
+       OR  list_category ilike 'deals%'
+       OR  list_category ilike 'brand%'
+       OR  list_category ilike 'campaign%'
+       OR  list_category ilike 'department%'
+       OR  page_type = 'plp', PDP AS (event_category = 'eec'
+       AND event_action = 'detail'
+       AND event_label IN ('In Stock',
+                           'Out of Stock'))
+       OR page_type = 'pdp', ATC AS event_category ='eec'
+       AND event_action = 'addToCart', sessions AS event_id IS NOT NULL, checkout AS event_category =
+           'eec'
+       AND event_action = 'checkout'
+       AND event_label = 'checkout', Purchase AS event_category = 'eec'
+       AND event_action = 'purchase'
+       AND order_id IS NOT NULL )
+WHERE
+        funnel_step = 'PURCHASE' and session_date BETWEEN $start_date AND $end_date;
+
+--  aggregate funnel success to the session level
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sfw_exp_funnel_agg ON COMMIT preserve rows AS
+SELECT
+    --session_date,
+    --device_category,
+    --channel,
+    --active_autoship_flag,
+    --new_customer_flag,
+    --session_id,
+    COUNT(DISTINCT
+          CASE
+              WHEN funnel_step='CHECKOUT'
+                  THEN session_id
+              END) atc_success_session_flag,
+    COUNT(DISTINCT
+          CASE
+              WHEN funnel_step='PDP'
+                  THEN session_id
+              END) plp_success_session_flag,
+    COUNT(DISTINCT
+          CASE
+              WHEN funnel_step='ATC'
+                  THEN session_id
+              END ) pdp_success_session_flag,
+    COUNT(DISTINCT
+          CASE
+              WHEN funnel_step='PURCHASE'
+                  THEN session_id
+              END) checkout_success_session_flag
+FROM
+    ecom_sandbox.tmp_sfw_exp_funnel_steps;
+--GROUP BY
+    --1,2,3,4,5,6,7,8,9;
+
+SELECT * FROM ecom_sandbox.tmp_sfw_exp_funnel_agg;
