@@ -1,4 +1,4 @@
-set date_date = '{{ds}}';
+set (startdate, enddate) = ('2023-05-25', (select max(ga_sessions_date) from ga.ga_sessions_hits where ga_sessions_date >= '2023-05-25' and load_type = 'daily'));
 
 -- Collect data from GA.SESSIONS_HIT table
 CREATE OR REPLACE LOCAL TEMP TABLE ecom_sandbox.sfw_r5_sessions ON COMMIT PRESERVE ROWS AS
@@ -32,43 +32,40 @@ SELECT
     page_title,
     first_value(referer) ignore nulls over (partition BY ga_sessions_date, unique_visit_id ORDER BY hit_timestamp) referer,
     first_value(personalization_id) ignore nulls over (partition BY ga_sessions_date, unique_visit_id ORDER BY hit_timestamp) personalization_id,
-    convert_timezone('UTC', 'America/New_York', hit_timestamp) AS timestamp,
-    CASE WHEN page_hostname like 'auth%.chewy.com' THEN 'R5' else 'Legacy' end as variation
-FROM ga.ga_sessions_hits 
-WHERE timestamp BETWEEN '2023-04-07 17:00:00' AND '2023-04-13 17:00:00';
---AND dataset='web'
---AND NOT is_bot;
-
-select distinct page_title, page_path from ga.ga_sessions_hits where page_title like 'Sign In' AND page_path IN ('%app/login%', '%/auth/realms/chewy-auth%') and ga_sessions_date='2023-04-13';
-
-select distinct page_title, page_path from ga.ga_sessions_hits where page_title='Sign In | Chewy.com' AND (page_path like '%app/login%' OR page_path like '%/auth/realms/chewy-auth%') AND IS_EXIT=TRUE and ga_sessions_date between '2023-04-08' and '2023-04-13';
+    convert_timezone('UTC', 'America/New_York', hit_timestamp) AS timestamp
+    --CASE WHEN page_hostname like 'auth%.chewy.com' THEN 'R5' else 'Legacy' end as variation
+FROM EDLDB_QA.ga.ga_sessions_hits
+WHERE ga_sessions_date >= $startdate
+--between $startdate and $enddate
+AND dataset='web'
+AND NOT is_bot;
 
 -- identify and count key activities
 CREATE OR REPLACE LOCAL TEMP TABLE ecom_sandbox.sfw_r5_aggregate ON COMMIT PRESERVE ROWS AS
 SELECT 
-    variation,
-    --ga_sessions_date,
-    --device_category,
+    --variation,
+    ga_sessions_date,
+    device_category,
     --active_autoship_flag,
     --tried_autoship_flag
-    --channel,
+    channel,
     --referer,
     --source,
     --medium,
-    --new_customer_flag,
+    new_customer_flag,
     --customer_id,
     --personalization_id,
     --customer_session_id,
-    --unique_visit_id,
+    unique_visit_id,
     COUNT(DISTINCT unique_visit_id) AS total_sessions,
     COUNT(DISTINCT CASE WHEN event_category = 'eec' AND event_action = 'addToCart' THEN unique_visit_id END) AS atc_sessions,
     COUNT(DISTINCT CASE WHEN event_category = 'eec' AND event_action = 'checkout' AND event_label = 'checkout'  THEN unique_visit_id END) AS checkout_sessions,
     COUNT(DISTINCT CASE WHEN event_action='purchase' and event_category='eec' and transaction_id IS NOT NULL THEN unique_visit_id END) AS purchase_sessions,
-    COUNT(DISTINCT CASE WHEN event_action='purchase' and event_category='eec' and transaction_id IS NOT NULL THEN transaction_id ELSE 0 END) AS orders,
+    COUNT(DISTINCT CASE WHEN event_action='purchase' and transaction_id IS NOT NULL THEN transaction_id END) AS orders,
     SUM(DISTINCT CASE WHEN event_action='purchase' and event_category='eec' and transaction_id IS NOT NULL THEN transaction_revenue ELSE 0 END) AS transaction_revenue,
     SUM(DISTINCT CASE WHEN event_action='purchase' and event_category='eec' and transaction_id IS NOT NULL THEN transaction_units ELSE 0 END) AS transaction_quantity,
     --sign-in metrics
-    COUNT(DISTINCT CASE WHEN AUTHENTICATION_STATE='authenticated' THEN unique_visit_id END) AS sign_in_sessions,
+    COUNT(DISTINCT CASE WHEN AUTHENTICATION_STATE IN ('authenticated','fully-authenticated') THEN unique_visit_id END) AS sign_in_sessions,
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label = 'view' THEN unique_hit_id END) AS sign_in_page_impressions,
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label = 'view' THEN unique_visit_id END) AS sign_in_page_sessions,
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='sign-in' AND event_label = 'submit' THEN unique_hit_id END) AS sign_in_clicks,
@@ -86,27 +83,26 @@ SELECT
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='forgot-password' AND event_label = 'view' THEN unique_visit_id END) AS pw_reset_request_page_sessions,
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='forgot-password' AND event_label = 'submit' THEN unique_hit_id END) AS request_reset_pw_clicks,
     COUNT(DISTINCT CASE WHEN event_category='complete-reset-pw' AND event_action='complete' AND event_label = 'view' THEN unique_hit_id END) AS pw_reset_page_impressions,
+    COUNT(DISTINCT CASE WHEN event_category='complete-reset-pw' AND event_action='complete' AND event_label = 'view' THEN unique_visit_id END) AS pw_reset_page_sessions,
     COUNT(DISTINCT CASE WHEN list_category='change-password' AND is_exit=TRUE THEN unique_visit_id END) AS pw_reset_page_exit_sessions,
     --ReCAPTCHA
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='recaptcha' AND event_label = 'view' THEN unique_hit_id END) AS  recaptcha_impressions,
     COUNT(DISTINCT CASE WHEN event_category='authenticate' AND event_action='recaptcha' AND event_label = 'check' THEN unique_hit_id END) AS  recaptcha_success
 FROM ecom_sandbox.sfw_r5_sessions
-GROUP BY 1;
-
-SELECT * FROM ecom_sandbox.sfw_r5_aggregate;
+GROUP BY 1,2,3,4,5;
 
 -- calculate funnel
 create or replace local temp table ecom_sandbox.sfw_r5_funnel_steps on commit preserve rows as
 select
-    --ga_sessions_date,
-    --device_category,
+    ga_sessions_date,
+    device_category,
     --active_autoship_flag,
     --tried_autoship_flag
-    --channel,
+    channel,
     --referer,
     --source,
     --medium,
-    --new_customer_flag,
+    new_customer_flag,
     --customer_id,
     --personalization_id,
     --customer_session_id,
@@ -131,21 +127,112 @@ where funnel_step = 'CHECKOUT';
 
 create or replace local temp table ecom_sandbox.sfw_r5_funnel_agg on commit preserve rows as
 select
-    --ga_sessions_date,
-    --device_category,
+    ga_sessions_date,
+    device_category,
     --active_autoship_flag,
     --tried_autoship_flag
-    --channel,
+    channel,
     --referer,
     --source,
     --medium,
-    --new_customer_flag,
+    new_customer_flag,
     --customer_id,
     --personalization_id,
     --customer_session_id,
-    --unique_visit_id,
+    unique_visit_id,
     count(distinct case when funnel_step='CHECKOUT' then  UNIQUE_VISIT_ID  end)  atc_success_sessions
-from ecom_sandbox.sfw_r5_funnel_steps;
---group by 1,2,3,4,5,6,7,8;
+from ecom_sandbox.sfw_r5_funnel_steps
+group by 1,2,3,4,5;
 
-select * from ecom_sandbox.sfw_r5_funnel_agg;
+
+delete from ECOM_SANDBOX.sfw_R5_GA
+where ga_sessions_date >= $startdate
+--between $startdate and $enddate 
+;
+
+
+INSERT INTO ECOM_SANDBOX.sfw_R5_GA
+select UNIQUE_VISIT_ID, GA_SESSIONS_DATE, 
+--exp_user_id,
+DEVICE_CATEGORY, 
+--ACTIVE_AUTOSHIP_FLAG, 
+CHANNEL, new_customer_flag, 
+--TEST, VARIATION,
+total_sessions,
+atc_sessions,
+checkout_sessions,
+purchase_sessions,
+orders,
+transaction_revenue,
+transaction_quantity,
+    --sign-in metrics
+sign_in_sessions,
+sign_in_page_impressions,
+sign_in_page_sessions,
+sign_in_clicks,
+sign_in_success,
+sign_in_exit_sessions,
+    --registration metrics
+registration_page_impressions,
+registration_page_sessions,
+registration_clicks,
+registration_success,
+registration_exit_sessions,
+    --pw reset metrics
+forgot_pw_clicks,
+pw_reset_request_page_impressions,
+pw_reset_request_page_sessions,
+request_reset_pw_clicks,
+pw_reset_page_impressions,
+pw_reset_page_sessions,
+pw_reset_page_exit_sessions,
+    --ReCAPTCHA
+recaptcha_impressions,
+recaptcha_success,
+--nvl(CHECKOUT_SESSIONS_CNT,0) as CHECKOUT_SESSIONS_CNT, nvl(PDP_SESSIONS_CNT, 0) as PDP_SESSIONS_CNT, nvl(ATC_SESSIONS_CNT, 0) as ATC_SESSIONS_CNT, 
+nvl(atc_success_sessions, 0) as atc_success_sessions
+from (
+select a.*, b.atc_success_sessions
+  from ecom_sandbox.sfw_r5_aggregate a
+  left join ecom_sandbox.sfw_r5_funnel_agg b
+  on a.ga_sessions_date=b.ga_sessions_date 
+  and a.device_category=b.device_category å
+  and a.channel=b.channel 
+  and a.UNIQUE_VISIT_ID=b.UNIQUE_VISIT_ID
+  --and a.Active_Autoship_Flag=b.Active_Autoship_Flag 
+  and a.new_customer_flag=b.new_customer_flag
+  --and a.Test = b.Test
+  --and a.Variation = b.Variation
+  order by a.UNIQUE_VISIT_ID) as final
+WHERE ga_sessions_date >= $startdate;
+
+SELECT * FROM ECOM_SANDBOX.sfw_R5_GA;
+
+-----------------------------------
+--Query used for investigation
+-----------------------------------
+--Query to get Variation using page_path
+SELECT case when page_path ilike '%app/login%' then 'Legacy' 
+            when page_path ilike '%app/register%' then 'Legacy' 
+            when page_path ilike '%app/resetpassword%' then 'Legacy' 
+            when page_path ilike '%auth/realms%' then 'R5'
+            else 'other'
+        end as variation, 
+        count(distinct unique_visit_id) 
+from ga.ga_sessions_hits 
+where ga_sessions_date>='2023-05-25' 
+      and 
+      ((event_category ='authenticate' AND event_action IN ('sign-in','create-account')) OR (event_category='complete-reset-pw' AND event_action='complete')) AND event_label = 'view'
+group by 1;
+
+-- cd12 and count of sessions for sign-in page and create-account page
+SELECT hit_custom_attributes:app_version as app_version, page_title, page_path, page_hostname, count(distinct unique_visit_id) 
+from ga.ga_sessions_hits 
+where ga_sessions_date>='2023-05-25' and event_category='authenticate' AND event_action IN ('sign-in','create-account') AND event_label = 'view' 
+group by 1,2,3,4;
+
+-- cd132 of sign-in or create-account success event
+SELECT hit_custom_attributes:login_page as login_page, page_title, page_path, page_hostname, count(distinct unique_visit_id) 
+from ga.ga_sessions_hits 
+where ga_sessions_date>='2023-05-25' and event_category='authenticate' AND event_action IN ('sign-in','create-account') AND event_label = 'success' 
+group by 1,2,3,4;
